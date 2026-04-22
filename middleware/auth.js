@@ -4,7 +4,7 @@ const { UnauthenticatedError } = require('../errors')
 const authMiddleware = async (req, res, next) => {
   const authHeader = req.headers.authorization
   if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    throw new UnauthenticatedError('No token provided')
+    throw new UnauthenticatedError('auth failed')
   }
 
   const token = authHeader.split(' ')[1]
@@ -14,7 +14,7 @@ const authMiddleware = async (req, res, next) => {
     req.user = { userId: payload.userId }
     next()
   } catch (error) {
-    throw new UnauthenticatedError('Not authorized to access this route')
+    throw new UnauthenticatedError('auth failed')
   }
 }
 

@@ -6,7 +6,7 @@ const { BadRequestError, UnauthenticatedError } = require('../errors')
 const register = async (userData) => {
   const existingUser = await userRepository.findByEmail(userData.email)
   if (existingUser) {
-    throw new BadRequestError('Email already in use')
+    throw new BadRequestError('auth failed')
   }
 
   const salt = await bcrypt.genSalt(10)
@@ -30,12 +30,12 @@ const register = async (userData) => {
 const login = async (email, password) => {
   const user = await userRepository.findByEmail(email)
   if (!user) {
-    throw new UnauthenticatedError('Invalid credentials')
+    throw new UnauthenticatedError('login failed')
   }
 
   const isPasswordCorrect = await bcrypt.compare(password, user.password_hash)
   if (!isPasswordCorrect) {
-    throw new UnauthenticatedError('Invalid credentials')
+    throw new UnauthenticatedError('login failed')
   }
 
   const token = jwt.sign({ userId: user.id }, process.env.JWT_SECRET, {
@@ -50,7 +50,7 @@ const login = async (email, password) => {
 const findUserById = async (id) => {
   const user = await userRepository.findById(id)
   if (!user) {
-    throw new UnauthenticatedError('User not found')
+    throw new UnauthenticatedError('auth failed')
   }
   const { password_hash, ...userWithoutPassword } = user
   return userWithoutPassword
