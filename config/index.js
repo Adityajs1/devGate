@@ -38,6 +38,11 @@ const env = cleanEnv(process.env, {
   // Upstream Gateway Proxying
   DEFAULT_UPSTREAM_URL: str({ default: 'https://httpbin.org', desc: 'Default upstream destination for proxying' }),
   PROXY_TIMEOUT_MS: num({ default: 10000, desc: 'Upstream HTTP request timeout in ms' }),
+
+  // Elasticsearch Configuration
+  ELASTICSEARCH_URL: str({ default: 'http://localhost:9200', desc: 'Elasticsearch endpoint' }),
+  ELASTICSEARCH_INDEX: str({ default: 'gateway-logs', desc: 'Index name for proxy logs' }),
+  LOG_LEVEL: str({ default: 'info', choices: ['error', 'warn', 'info', 'http', 'verbose', 'debug'] }),
 })
 
 module.exports = env
