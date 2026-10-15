@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node app.js",
     "dev": "nodemon app.js",
-    "test": "node --test tests/api-key.test.js",
+    "test": "node --test tests/*.test.js",
     "migrate": "node db/migrate.js"
   },
   "keywords": [],
@@ -19,6 +19,7 @@
     "envalid": "^8.1.1",
     "express": "^5.2.1",
     "http-status-codes": "^2.3.0",
+    "ioredis": "^6.0.0",
     "jsonwebtoken": "^9.0.3",
     "pg": "^8.20.0",
     "uuid": "^14.0.0",

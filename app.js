@@ -1,4 +1,4 @@
-require('dotenv').config()
+const config = require('./config') // Envalid startup validation
 const express = require('express')
 const app = express()
 
@@ -11,13 +11,13 @@ app.use('/api/v1', mainRouter)
 app.use(notFoundMiddleware)
 app.use(errorHandlerMiddleware)
 
-const port = process.env.PORT || 5173
+const port = config.PORT || 5173
 
 const start = async () => {
   try {
     app.listen(port, () => console.log(`Server is listening on the port ${port}...`))
   } catch (error) {
-    console.log(error)
+    console.error('Failed to start server:', error)
   }
 }
 
