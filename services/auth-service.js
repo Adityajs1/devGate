@@ -27,7 +27,7 @@ const register = async (userData) => {
   return { user: userWithoutPassword, token }
 }
 
-const login = async (email, password) => {
+ const login = async (email, password) => {
   const user = await userRepository.findByEmail(email)
   if (!user) {
     throw new UnauthenticatedError('login failed')

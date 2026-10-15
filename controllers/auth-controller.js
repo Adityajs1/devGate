@@ -5,7 +5,7 @@ const { BadRequestError } = require('../errors')
 
 const register = async (req, res) => {
   const validationResult = registerSchema.safeParse(req.body)
-  if (!validationResult.success) {
+  if (!validationResult.success){
     const errorMessage = validationResult.error.issues.map(err => err.message).join(', ')
     throw new BadRequestError(errorMessage)
   }
