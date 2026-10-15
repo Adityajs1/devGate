@@ -58,6 +58,9 @@ const createApiKey = async (userId, keyData = {}) => {
   const displayKey = getDisplayKey(rawKey, prefix)
   const keyHash = hashKey(rawKey)
 
+  const plan = keyData.plan || 'free'
+  const rateLimitPerMinute = keyData.rateLimitPerMinute || null
+
   // Persist only prefix, display_key, key_hash, and metadata
   const createdRecord = await apiKeyRepository.create({
     userId,
@@ -65,8 +68,20 @@ const createApiKey = async (userId, keyData = {}) => {
     prefix,
     displayKey,
     keyHash,
+    plan,
+    rateLimitPerMinute,
     expiresAt,
   })
+
+  // Asynchronously trigger webhook event: api_key.created
+  const queueService = require('./queue-service')
+  queueService.triggerWebhookEvent('api_key.created', {
+    id: createdRecord.id,
+    name: createdRecord.name,
+    prefix: createdRecord.prefix,
+    plan: createdRecord.plan,
+    rate_limit_per_minute: createdRecord.rate_limit_per_minute,
+  }, userId).catch(() => {})
 
   // Return the raw key to the developer - THIS IS SHOWN ONCE
   return {
@@ -75,6 +90,8 @@ const createApiKey = async (userId, keyData = {}) => {
     name: createdRecord.name,
     prefix: createdRecord.prefix,
     display_key: createdRecord.display_key,
+    plan: createdRecord.plan,
+    rate_limit_per_minute: createdRecord.rate_limit_per_minute,
     is_active: createdRecord.is_active,
     expires_at: createdRecord.expires_at,
     created_at: createdRecord.created_at,

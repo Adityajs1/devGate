@@ -51,6 +51,8 @@ const apiKeyAuthMiddleware = async (req, res, next) => {
     name: keyRecord.key_name || keyRecord.name,
     prefix: keyRecord.prefix,
     displayKey: keyRecord.display_key,
+    plan: keyRecord.plan || 'free',
+    rate_limit_per_minute: keyRecord.rate_limit_per_minute || 100,
     createdAt: keyRecord.created_at,
     lastUsedAt: keyRecord.last_used_at,
   }

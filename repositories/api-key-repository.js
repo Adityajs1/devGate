@@ -4,17 +4,25 @@ const db = require('../db/connect')
 const memoryKeys = []
 const memoryLogs = []
 
+const PLAN_LIMITS = {
+  free: 100,
+  pro: 1000,
+  enterprise: 10000,
+}
+
 /**
  * Creates a new API key record in the database.
- * Storing only prefix, key_hash, and metadata.
+ * Storing prefix, key_hash, plan, rate_limit, and metadata.
  */
-const create = async ({ userId, name, prefix, displayKey, keyHash, expiresAt = null }) => {
+const create = async ({ userId, name, prefix, displayKey, keyHash, plan = 'free', rateLimitPerMinute = null, expiresAt = null }) => {
+  const finalLimit = rateLimitPerMinute || PLAN_LIMITS[plan] || 100
+
   try {
     const res = await db.query(
-      `INSERT INTO api_keys (user_id, name, prefix, display_key, key_hash, expires_at)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING id, user_id, name, prefix, display_key, is_active, created_at, expires_at`,
-      [userId, name, prefix, displayKey, keyHash, expiresAt]
+      `INSERT INTO api_keys (user_id, name, prefix, display_key, key_hash, plan, rate_limit_per_minute, expires_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       RETURNING id, user_id, name, prefix, display_key, plan, rate_limit_per_minute, is_active, created_at, expires_at`,
+      [userId, name, prefix, displayKey, keyHash, plan, finalLimit, expiresAt]
     )
     if (res && res.rows && res.rows.length > 0) {
       return res.rows[0]
@@ -30,6 +38,8 @@ const create = async ({ userId, name, prefix, displayKey, keyHash, expiresAt = n
     prefix,
     display_key: displayKey,
     key_hash: keyHash,
+    plan: plan || 'free',
+    rate_limit_per_minute: finalLimit,
     is_active: true,
     last_used_at: null,
     expires_at: expiresAt || null,
@@ -43,6 +53,8 @@ const create = async ({ userId, name, prefix, displayKey, keyHash, expiresAt = n
     name: newKey.name,
     prefix: newKey.prefix,
     display_key: newKey.display_key,
+    plan: newKey.plan,
+    rate_limit_per_minute: newKey.rate_limit_per_minute,
     is_active: newKey.is_active,
     created_at: newKey.created_at,
     expires_at: newKey.expires_at,
@@ -52,7 +64,6 @@ const create = async ({ userId, name, prefix, displayKey, keyHash, expiresAt = n
 /**
  * Finds an active API key by its SHA-256 hash.
  * Uses SQL JOIN with the users table to attach user metadata.
- * Uses the idx_api_keys_key_hash index for O(1) performance.
  */
 const findByKeyHash = async (keyHash) => {
   try {
@@ -64,6 +75,8 @@ const findByKeyHash = async (keyHash) => {
         k.prefix,
         k.display_key,
         k.key_hash,
+        k.plan,
+        k.rate_limit_per_minute,
         k.is_active,
         k.last_used_at,
         k.expires_at,
@@ -81,7 +94,6 @@ const findByKeyHash = async (keyHash) => {
     }
     return null
   } catch (error) {
-    // In-memory fallback
     const key = memoryKeys.find((k) => k.key_hash === keyHash)
     if (!key) return null
     return {
@@ -94,11 +106,7 @@ const findByKeyHash = async (keyHash) => {
 }
 
 /**
- * Finds all API keys for a specific user.
- * Uses SQL LEFT JOIN on api_key_usage_logs with aggregations:
- * - COUNT(l.id) AS total_requests
- * - MAX(l.created_at) AS last_request_at
- * - COUNT(CASE WHEN l.status_code >= 400 THEN 1 END) AS failed_requests
+ * Finds all API keys for a specific user with aggregations.
  */
 const findByUserId = async (userId) => {
   try {
@@ -109,6 +117,8 @@ const findByUserId = async (userId) => {
         k.name,
         k.prefix,
         k.display_key,
+        k.plan,
+        k.rate_limit_per_minute,
         k.is_active,
         k.last_used_at,
         k.expires_at,
@@ -128,7 +138,6 @@ const findByUserId = async (userId) => {
     }
     return []
   } catch (error) {
-    // In-memory fallback with aggregations
     return memoryKeys
       .filter((k) => k.user_id === userId)
       .map((k) => {
@@ -139,6 +148,8 @@ const findByUserId = async (userId) => {
           name: k.name,
           prefix: k.prefix,
           display_key: k.display_key,
+          plan: k.plan,
+          rate_limit_per_minute: k.rate_limit_per_minute,
           is_active: k.is_active,
           last_used_at: k.last_used_at,
           expires_at: k.expires_at,
@@ -152,13 +163,10 @@ const findByUserId = async (userId) => {
   }
 }
 
-/**
- * Finds a single API key by id and userId.
- */
 const findByIdAndUserId = async (id, userId) => {
   try {
     const res = await db.query(
-      'SELECT id, user_id, name, prefix, display_key, is_active, last_used_at, expires_at, created_at FROM api_keys WHERE id = $1 AND user_id = $2 LIMIT 1',
+      'SELECT id, user_id, name, prefix, display_key, plan, rate_limit_per_minute, is_active, last_used_at, expires_at, created_at FROM api_keys WHERE id = $1 AND user_id = $2 LIMIT 1',
       [id, userId]
     )
     if (res && res.rows && res.rows.length > 0) {
@@ -170,16 +178,13 @@ const findByIdAndUserId = async (id, userId) => {
   }
 }
 
-/**
- * Revokes an API key (sets is_active = FALSE).
- */
 const revoke = async (id, userId) => {
   try {
     const res = await db.query(
       `UPDATE api_keys
        SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP
        WHERE id = $1 AND user_id = $2
-       RETURNING id, name, prefix, display_key, is_active, updated_at`,
+       RETURNING id, name, prefix, display_key, plan, is_active, updated_at`,
       [id, userId]
     )
     if (res && res.rows && res.rows.length > 0) {
@@ -196,6 +201,7 @@ const revoke = async (id, userId) => {
         name: key.name,
         prefix: key.prefix,
         display_key: key.display_key,
+        plan: key.plan,
         is_active: key.is_active,
         updated_at: key.updated_at,
       }
@@ -204,15 +210,9 @@ const revoke = async (id, userId) => {
   }
 }
 
-/**
- * Updates the last_used_at timestamp on key usage.
- */
 const updateLastUsed = async (id) => {
   try {
-    await db.query(
-      'UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = $1',
-      [id]
-    )
+    await db.query('UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = $1', [id])
   } catch (error) {
     const key = memoryKeys.find((k) => k.id === id)
     if (key) {
@@ -221,9 +221,6 @@ const updateLastUsed = async (id) => {
   }
 }
 
-/**
- * Records an entry into the api_key_usage_logs table.
- */
 const recordUsage = async ({ apiKeyId, endpoint, method, statusCode, ipAddress }) => {
   try {
     await db.query(
@@ -244,10 +241,6 @@ const recordUsage = async ({ apiKeyId, endpoint, method, statusCode, ipAddress }
   }
 }
 
-/**
- * Returns aggregated analytics for a specific API key.
- * SQL joins api_keys with api_key_usage_logs with aggregations.
- */
 const getKeyAnalytics = async (id, userId) => {
   try {
     const queryText = `
@@ -256,6 +249,8 @@ const getKeyAnalytics = async (id, userId) => {
         k.name,
         k.prefix,
         k.display_key,
+        k.plan,
+        k.rate_limit_per_minute,
         k.is_active,
         k.created_at,
         k.last_used_at,
@@ -283,6 +278,8 @@ const getKeyAnalytics = async (id, userId) => {
       name: key.name,
       prefix: key.prefix,
       display_key: key.display_key,
+      plan: key.plan,
+      rate_limit_per_minute: key.rate_limit_per_minute,
       is_active: key.is_active,
       created_at: key.created_at,
       last_used_at: key.last_used_at,

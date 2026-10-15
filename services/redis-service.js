@@ -20,7 +20,6 @@ class InMemoryRedis {
     }
 
     let entries = this.zsets.get(key)
-    // Remove items older than current sliding window
     entries = entries.filter((item) => item.score > clearBefore)
     this.zsets.set(key, entries)
 
@@ -36,7 +35,6 @@ class InMemoryRedis {
       }
     }
 
-    // Add current request to window
     entries.push({ score: now, member: `${now}_${Math.random().toString(36).substring(2, 7)}` })
     this.zsets.set(key, entries)
 
@@ -46,6 +44,19 @@ class InMemoryRedis {
       remaining: limit - count - 1,
       resetMs: windowMs,
     }
+  }
+
+  async incrementCounter(key, windowSeconds = 60) {
+    const item = this.strings.get(key)
+    const now = Date.now()
+    if (!item || (item.expiresAt && now > item.expiresAt)) {
+      this.strings.set(key, { value: '1', expiresAt: now + windowSeconds * 1000 })
+      return { count: 1, ttlSeconds: windowSeconds }
+    }
+    const count = parseInt(item.value, 10) + 1
+    item.value = count.toString()
+    const ttlSeconds = Math.max(1, Math.ceil((item.expiresAt - now) / 1000))
+    return { count, ttlSeconds }
   }
 
   async get(key) {
@@ -90,9 +101,10 @@ const inMemoryFallback = new InMemoryRedis()
 try {
   redisClient = new Redis(config.REDIS_URL, {
     maxRetriesPerRequest: 1,
-    connectTimeout: 1500,
+    connectTimeout: 1000,
     enableOfflineQueue: false,
     lazyConnect: true,
+    retryStrategy: () => null, // Do not spam reconnect if server is offline
   })
 
   redisClient.connect().then(() => {
@@ -102,7 +114,6 @@ try {
     }
   }).catch(() => {
     isConnected = false
-    // Graceful fallback to memory store
   })
 
   redisClient.on('error', () => {
@@ -113,9 +124,39 @@ try {
 }
 
 /**
+ * Real-world Redis Counter Rate Limiter
+ * Redis key: "rate:<key_identifier>:<timestamp_minute>"
+ * Value incremented on each request with TTL = 60s
+ */
+const incrementRateLimitCounter = async (key, windowSeconds = 60) => {
+  if (isConnected && redisClient && redisClient.status === 'ready') {
+    try {
+      const multi = redisClient.multi()
+      multi.incr(key)
+      multi.ttl(key)
+      const results = await multi.exec()
+      const count = results[0][1]
+      let ttlSeconds = results[1][1]
+
+      if (ttlSeconds === -1 || count === 1) {
+        await redisClient.expire(key, windowSeconds)
+        ttlSeconds = windowSeconds
+      }
+
+      return {
+        count,
+        ttlSeconds: Math.max(1, ttlSeconds),
+      }
+    } catch (err) {
+      return await inMemoryFallback.incrementCounter(key, windowSeconds)
+    }
+  }
+
+  return await inMemoryFallback.incrementCounter(key, windowSeconds)
+}
+
+/**
  * Sliding Window Rate Limiter
- * Uses Redis ZSET (ZREMRANGEBYSCORE, ZCARD, ZADD, EXPIRE) with millisecond timestamps
- * Fallback to in-memory sliding window when Redis is offline.
  */
 const checkRateLimit = async (key, limit, windowMs) => {
   if (isConnected && redisClient && redisClient.status === 'ready') {
@@ -130,11 +171,9 @@ const checkRateLimit = async (key, limit, windowMs) => {
       multi.expire(key, Math.ceil(windowMs / 1000))
 
       const results = await multi.exec()
-      // results[1][1] is zcard result before adding the current one
       const currentCount = results[1][1]
 
       if (currentCount >= limit) {
-        // Rollback the added item since limit exceeded
         await redisClient.zremrangebyscore(key, now, now)
         return {
           allowed: false,
@@ -151,7 +190,6 @@ const checkRateLimit = async (key, limit, windowMs) => {
         resetMs: windowMs,
       }
     } catch (err) {
-      // Fallback to in-memory
       return await inMemoryFallback.slidingWindow(key, limit, windowMs)
     }
   }
@@ -159,9 +197,6 @@ const checkRateLimit = async (key, limit, windowMs) => {
   return await inMemoryFallback.slidingWindow(key, limit, windowMs)
 }
 
-/**
- * Cache Get with JSON parsing
- */
 const getCache = async (key) => {
   if (isConnected && redisClient && redisClient.status === 'ready') {
     try {
@@ -176,25 +211,17 @@ const getCache = async (key) => {
   return val ? JSON.parse(val) : null
 }
 
-/**
- * Cache Set with TTL in seconds
- */
 const setCache = async (key, value, ttlSeconds = 60) => {
   const serialized = JSON.stringify(value)
   if (isConnected && redisClient && redisClient.status === 'ready') {
     try {
       await redisClient.set(key, serialized, 'EX', ttlSeconds)
       return
-    } catch (e) {
-      // fallback
-    }
+    } catch (e) {}
   }
   await inMemoryFallback.set(key, serialized, 'EX', ttlSeconds)
 }
 
-/**
- * Delete a specific cache key
- */
 const delCache = async (key) => {
   if (isConnected && redisClient && redisClient.status === 'ready') {
     try {
@@ -204,9 +231,6 @@ const delCache = async (key) => {
   await inMemoryFallback.del(key)
 }
 
-/**
- * Invalidate cache by prefix pattern
- */
 const invalidateCachePrefix = async (prefix) => {
   if (isConnected && redisClient && redisClient.status === 'ready') {
     try {
@@ -222,6 +246,7 @@ const invalidateCachePrefix = async (prefix) => {
 module.exports = {
   redisClient,
   checkRateLimit,
+  incrementRateLimitCounter,
   getCache,
   setCache,
   delCache,
