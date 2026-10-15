@@ -1,6 +1,7 @@
 const config = require('../config')
 const redisService = require('../services/redis-service')
 const queueService = require('../services/queue-service')
+const metricsService = require('../services/metrics-service')
 const { RateLimitError } = require('../errors')
 
 const PLAN_LIMITS = {
@@ -16,7 +17,9 @@ const PLAN_LIMITS = {
  * Redis key: "rate:<displayKey_or_id>:<YYYY-MM-DDTHH:mm>"
  * Increments counter on each request with TTL = 60s.
  * Blocks requests when count exceeds plan.limit (HTTP 429).
- * Triggers asynchronous webhook delivery on breach.
+ * Decouples slow tasks by enqueuing background jobs:
+ * - Near limit warning: queue.add('send-webhook', { keyId, event: 'limit.warning' })
+ * - Exceeded: queue.add('send-webhook', { keyId, event: 'rate_limit.exceeded' })
  */
 const rateLimiter = (options = {}) => {
   return async (req, res, next) => {
@@ -37,7 +40,6 @@ const rateLimiter = (options = {}) => {
     const nowIso = new Date().toISOString()
     const minuteWindow = nowIso.substring(0, 16)
 
-    // Key identifier (Stripe display key or API key ID or client IP)
     const keyIdentifier = req.apiKey
       ? (req.apiKey.displayKey || req.apiKey.id)
       : (req.ip || req.socket.remoteAddress || 'anonymous')
@@ -52,23 +54,42 @@ const rateLimiter = (options = {}) => {
     res.setHeader('X-RateLimit-Limit', planLimit)
     res.setHeader('X-RateLimit-Reset', ttlSeconds)
 
+    // 5. Check if key is approaching limit (e.g. 80% threshold) -> queue background job
+    const warningThreshold = Math.max(1, Math.floor(planLimit * 0.8))
+    if (count === warningThreshold) {
+      queueService
+        .addJob('send-webhook', {
+          keyId: req.apiKey ? req.apiKey.id : 'anonymous',
+          event: 'limit.warning',
+          currentCount: count,
+          limit: planLimit,
+          remaining: planLimit - count,
+          percentageUsed: Math.round((count / planLimit) * 100),
+        })
+        .catch(() => {})
+    }
+
+    // 6. Over limit -> block request (HTTP 429)
     if (count > planLimit) {
       res.setHeader('X-RateLimit-Remaining', 0)
       res.setHeader('Retry-After', ttlSeconds)
 
-      // 5. Trigger Webhook Event: rate_limit.exceeded via Background Job Queue
-      const eventPayload = {
-        event: 'rate_limit.exceeded',
-        apiKey: req.apiKey ? req.apiKey.displayKey : 'anonymous',
+      // Prometheus metrics tracking
+      metricsService.rateLimitBlocksTotal.inc({
         plan: planName,
-        limit: planLimit,
-        currentCount: count,
-        retryAfterSeconds: ttlSeconds,
-        timestamp: new Date().toISOString(),
-      }
+        key_id: req.apiKey ? req.apiKey.id : 'anonymous',
+      })
 
+      // Dispatch rate_limit.exceeded background job
       queueService
-        .triggerWebhookEvent('rate_limit.exceeded', eventPayload, req.user ? req.user.userId : null)
+        .addJob('send-webhook', {
+          keyId: req.apiKey ? req.apiKey.id : 'anonymous',
+          event: 'rate_limit.exceeded',
+          currentCount: count,
+          limit: planLimit,
+          retryAfterSeconds: ttlSeconds,
+          timestamp: new Date().toISOString(),
+        })
         .catch(() => {})
 
       throw new RateLimitError(

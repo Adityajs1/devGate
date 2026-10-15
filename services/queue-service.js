@@ -1,15 +1,62 @@
 const { Queue, Worker } = require('bullmq')
 const config = require('../config')
 const webhookService = require('./webhook-service')
+const backgroundTasks = require('./background-tasks')
+const metricsService = require('./metrics-service')
 const { redisClient } = require('./redis-service')
 
-const QUEUE_NAME = 'devgate-webhooks'
+const QUEUE_NAME = 'devgate-tasks'
 const MAX_ATTEMPTS = 3
 const INITIAL_BACKOFF_MS = 300
 
-let webhookQueue = null
-let webhookWorker = null
+let taskQueue = null
+let taskWorker = null
 let useBullMQ = false
+
+/**
+ * Universal job executor handling send-webhook, email-usage-report, cleanup-expired-keys
+ */
+const executeJob = async (job) => {
+  const { name, data } = job
+
+  switch (name) {
+    case 'send-webhook':
+      return await backgroundTasks.handleSendWebhook(data)
+
+    case 'email-usage-report':
+      return await backgroundTasks.handleGenerateUsageReport(data)
+
+    case 'cleanup-expired-keys':
+      return await backgroundTasks.handleCleanupExpiredKeys()
+
+    case 'webhook-dispatch':
+    default: {
+      const { webhookId, url, secret, event, payload } = data
+      const timestamp = Math.floor(Date.now() / 1000)
+      const payloadString = JSON.stringify(payload)
+      const signature = webhookService.signPayload(secret, payloadString, timestamp)
+
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'DevGate-Webhook-Dispatcher/1.0',
+          'X-DevGate-Event': event,
+          'X-DevGate-Timestamp': timestamp.toString(),
+          'X-DevGate-Signature': `t=${timestamp},v1=${signature}`,
+        },
+        body: payloadString,
+        signal: AbortSignal.timeout(5000),
+      })
+
+      if (!response.ok) {
+        throw new Error(`Upstream webhook receiver returned HTTP ${response.status}`)
+      }
+
+      return { status: response.status }
+    }
+  }
+}
 
 // In-Memory resilient queue fallback when Redis server is offline
 class InMemoryQueue {
@@ -40,16 +87,19 @@ class InMemoryQueue {
     const job = this.jobs.shift()
     try {
       job.attempts++
-      await processWebhookJob(job)
-      // Successfully delivered
-      await webhookService.recordDelivery({
-        webhookId: job.data.webhookId,
-        event: job.data.event,
-        payload: job.data.payload,
-        status: 'delivered',
-        attempts: job.attempts,
-        responseStatus: 200,
-      })
+      await executeJob(job)
+      metricsService.queueJobsTotal.inc({ job_name: job.name, status: 'completed' })
+
+      if (job.data.webhookId) {
+        await webhookService.recordDelivery({
+          webhookId: job.data.webhookId,
+          event: job.data.event || 'background.job',
+          payload: job.data.payload || job.data,
+          status: 'delivered',
+          attempts: job.attempts,
+          responseStatus: 200,
+        })
+      }
     } catch (error) {
       if (job.attempts < job.maxAttempts) {
         // Exponential backoff
@@ -59,16 +109,20 @@ class InMemoryQueue {
           this.processNext()
         }, backoff)
       } else {
-        // Max retries exhausted -> Move to Dead Letter Queue (DLQ)
+        // Dead Letter Queue
+        metricsService.queueJobsTotal.inc({ job_name: job.name, status: 'dead_letter' })
         this.deadLetterQueue.push({ job, error: error.message, failedAt: new Date().toISOString() })
-        await webhookService.recordDelivery({
-          webhookId: job.data.webhookId,
-          event: job.data.event,
-          payload: job.data.payload,
-          status: 'dead_letter',
-          attempts: job.attempts,
-          errorMessage: error.message,
-        })
+
+        if (job.data.webhookId) {
+          await webhookService.recordDelivery({
+            webhookId: job.data.webhookId,
+            event: job.data.event || 'background.job',
+            payload: job.data.payload || job.data,
+            status: 'dead_letter',
+            attempts: job.attempts,
+            errorMessage: error.message,
+          })
+        }
       }
     } finally {
       this.isProcessing = false
@@ -85,56 +139,23 @@ class InMemoryQueue {
 
 const memoryQueue = new InMemoryQueue()
 
-/**
- * Worker handler that signs and sends the webhook payload
- */
-const processWebhookJob = async (job) => {
-  const { webhookId, url, secret, event, payload } = job.data
-
-  const timestamp = Math.floor(Date.now() / 1000)
-  const payloadString = JSON.stringify(payload)
-  const signature = webhookService.signPayload(secret, payloadString, timestamp)
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'User-Agent': 'DevGate-Webhook-Dispatcher/1.0',
-      'X-DevGate-Event': event,
-      'X-DevGate-Timestamp': timestamp.toString(),
-      'X-DevGate-Signature': `t=${timestamp},v1=${signature}`,
-    },
-    body: payloadString,
-    signal: AbortSignal.timeout(5000),
-  })
-
-  if (!response.ok) {
-    throw new Error(`Upstream webhook receiver returned HTTP ${response.status}`)
-  }
-
-  return { status: response.status }
-}
-
-// Initialize BullMQ if Redis client is verified connected
+// Initialize BullMQ if Redis client is connected
 if (redisClient && redisClient.status === 'ready') {
   try {
-    webhookQueue = new Queue(QUEUE_NAME, {
+    taskQueue = new Queue(QUEUE_NAME, {
       connection: redisClient,
       defaultJobOptions: {
         attempts: MAX_ATTEMPTS,
-        backoff: {
-          type: 'exponential',
-          delay: INITIAL_BACKOFF_MS,
-        },
+        backoff: { type: 'exponential', delay: INITIAL_BACKOFF_MS },
         removeOnComplete: true,
         removeOnFail: false,
       },
     })
 
-    webhookWorker = new Worker(
+    taskWorker = new Worker(
       QUEUE_NAME,
       async (job) => {
-        return await processWebhookJob(job)
+        return await executeJob(job)
       },
       {
         connection: redisClient,
@@ -142,27 +163,32 @@ if (redisClient && redisClient.status === 'ready') {
       }
     )
 
-    webhookWorker.on('completed', async (job) => {
-      await webhookService.recordDelivery({
-        webhookId: job.data.webhookId,
-        event: job.data.event,
-        payload: job.data.payload,
-        status: 'delivered',
-        attempts: job.attemptsMade + 1,
-      })
-    })
-
-    webhookWorker.on('failed', async (job, err) => {
-      if (job && job.attemptsMade >= MAX_ATTEMPTS) {
-        // Sent to Dead Letter Queue (DLQ)
+    taskWorker.on('completed', async (job) => {
+      metricsService.queueJobsTotal.inc({ job_name: job.name, status: 'completed' })
+      if (job.data.webhookId) {
         await webhookService.recordDelivery({
           webhookId: job.data.webhookId,
           event: job.data.event,
           payload: job.data.payload,
-          status: 'dead_letter',
-          attempts: job.attemptsMade,
-          errorMessage: err.message,
+          status: 'delivered',
+          attempts: job.attemptsMade + 1,
         })
+      }
+    })
+
+    taskWorker.on('failed', async (job, err) => {
+      if (job && job.attemptsMade >= MAX_ATTEMPTS) {
+        metricsService.queueJobsTotal.inc({ job_name: job.name, status: 'dead_letter' })
+        if (job.data.webhookId) {
+          await webhookService.recordDelivery({
+            webhookId: job.data.webhookId,
+            event: job.data.event,
+            payload: job.data.payload,
+            status: 'dead_letter',
+            attempts: job.attemptsMade,
+            errorMessage: err.message,
+          })
+        }
       }
     })
 
@@ -173,30 +199,28 @@ if (redisClient && redisClient.status === 'ready') {
 }
 
 /**
- * Enqueue a webhook delivery job with retries and exponential backoff
+ * Universal job enqueueing method
+ * Example: queueService.addJob('send-webhook', { keyId, event: 'limit.warning' })
  */
-const enqueueWebhookDelivery = async ({ webhookId, url, secret, event, payload }) => {
-  if (useBullMQ && webhookQueue) {
+const addJob = async (name, data, opts = {}) => {
+  if (useBullMQ && taskQueue) {
     try {
-      return await webhookQueue.add(
-        'webhook-dispatch',
-        { webhookId, url, secret, event, payload },
-        {
-          attempts: MAX_ATTEMPTS,
-          backoff: { type: 'exponential', delay: INITIAL_BACKOFF_MS },
-        }
-      )
+      return await taskQueue.add(name, data, {
+        attempts: opts.attempts || MAX_ATTEMPTS,
+        backoff: { type: 'exponential', delay: INITIAL_BACKOFF_MS },
+      })
     } catch (e) {
-      return await memoryQueue.add('webhook-dispatch', { webhookId, url, secret, event, payload })
+      return await memoryQueue.add(name, data, opts)
     }
   }
 
-  return await memoryQueue.add('webhook-dispatch', { webhookId, url, secret, event, payload })
+  return await memoryQueue.add(name, data, opts)
 }
 
-/**
- * Triggers an event across all subscribed webhooks (e.g. rate_limit.exceeded)
- */
+const enqueueWebhookDelivery = async ({ webhookId, url, secret, event, payload }) => {
+  return await addJob('webhook-dispatch', { webhookId, url, secret, event, payload })
+}
+
 const triggerWebhookEvent = async (event, payload, userId = null) => {
   const subscriptions = await webhookService.findSubscribedWebhooks(event, userId)
   const jobs = []
@@ -215,20 +239,18 @@ const triggerWebhookEvent = async (event, payload, userId = null) => {
   return jobs
 }
 
-/**
- * Close worker and queue gracefully
- */
 const closeQueue = async () => {
   try {
-    if (webhookWorker) await webhookWorker.close()
-    if (webhookQueue) await webhookQueue.close()
+    if (taskWorker) await taskWorker.close()
+    if (taskQueue) await taskQueue.close()
   } catch (e) {}
 }
 
 module.exports = {
-  webhookQueue,
-  webhookWorker,
+  taskQueue,
+  taskWorker,
   memoryQueue,
+  addJob,
   enqueueWebhookDelivery,
   triggerWebhookEvent,
   closeQueue,
